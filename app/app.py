@@ -78,6 +78,56 @@ def draw_detections(image_bgr, results, conf_threshold):
     return image_rgb, detections
 
 
+def roboflow_bbox_to_xyxy(prediction, image_shape):
+    """Converte a bbox do Roboflow para coordenadas x1, y1, x2, y2."""
+    height, width = image_shape[:2]
+
+    if all(key in prediction for key in ("x", "y", "width", "height")):
+        center_x = float(prediction["x"])
+        center_y = float(prediction["y"])
+        box_width = float(prediction["width"])
+        box_height = float(prediction["height"])
+        x1 = center_x - box_width / 2
+        y1 = center_y - box_height / 2
+        x2 = center_x + box_width / 2
+        y2 = center_y + box_height / 2
+    elif all(key in prediction for key in ("x_min", "y_min", "x_max", "y_max")):
+        x1 = float(prediction["x_min"])
+        y1 = float(prediction["y_min"])
+        x2 = float(prediction["x_max"])
+        y2 = float(prediction["y_max"])
+    else:
+        return None
+
+    x1 = max(0, min(width - 1, int(x1)))
+    y1 = max(0, min(height - 1, int(y1)))
+    x2 = max(0, min(width - 1, int(x2)))
+    y2 = max(0, min(height - 1, int(y2)))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return x1, y1, x2, y2
+
+
+def draw_people_detections(image, people_detections):
+    for person in people_detections:
+        bbox = roboflow_bbox_to_xyxy(person, image.shape)
+        if bbox is None:
+            continue
+
+        x1, y1, x2, y2 = bbox
+        conf = float(person.get("confidence", 0))
+        label = f"person {conf:.2f}"
+
+        cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(image, (x1, y1 - h - 8), (x1 + w, y1), (0, 255, 0), -1)
+        cv2.putText(image, label, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+
+    return image
+
+
 def detect_people(image_bgr, conf_threshold, client=None):
     """Roda o modelo Roboflow de pessoas e retorna predicoes acima do limiar."""
     client = client or load_people_client()
@@ -146,6 +196,7 @@ if modo == "Imagem":
                 people_detections = detect_people(img_bgr, conf_threshold)
             except Exception as exc:
                 st.warning(f"Nao foi possivel rodar o modelo de pessoas: {exc}")
+        img_result = draw_people_detections(img_result, people_detections)
 
         col1, col2 = st.columns(2)
         with col1:
@@ -206,6 +257,7 @@ elif modo == "Video":
                         people_detections = detect_people(frame, conf_threshold)
                     except Exception:
                         people_detections = []
+                frame_result = draw_people_detections(frame_result, people_detections)
                 has_robbery = robbery_detected(detections, people_detections)
                 detection_count += len(detections)
                 robbery_count += int(has_robbery)
@@ -235,6 +287,7 @@ elif modo == "Camera":
 
         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
             img_bgr = frame.to_ndarray(format="bgr24")
+            raw_img_bgr = img_bgr.copy()
 
             results = self.model.predict(img_bgr, conf=self.conf, verbose=False)
             gun_detections = []
@@ -257,9 +310,10 @@ elif modo == "Camera":
             people_detections = []
             if gun_detections:
                 try:
-                    people_detections = detect_people(img_bgr, self.conf, self.people_client)
+                    people_detections = detect_people(raw_img_bgr, self.conf, self.people_client)
                 except Exception:
                     people_detections = []
+            img_bgr = draw_people_detections(img_bgr, people_detections)
 
             self.robbery_detected = robbery_detected(gun_detections, people_detections)
 
