@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
 /data
 /runs
+/cv2-gun
 
 __pycache__/
 *.py[codz]

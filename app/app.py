@@ -3,8 +3,9 @@ import cv2
 import av
 import numpy as np
 import tempfile
+import time
 from pathlib import Path
-from PIL import Image
+from inference_sdk import InferenceHTTPClient
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase
 
@@ -13,6 +14,9 @@ st.set_page_config(page_title="Gun Detection - YOLO26", page_icon="🔫", layout
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = APP_DIR.parent
+ROBOFLOW_API_URL = "https://serverless.roboflow.com"
+ROBOFLOW_API_KEY = "BbgTrEnq95LA9drZNK2f"
+PEOPLE_MODEL_ID = "people-detection-general/7"
 
 
 def resolve_model_path() -> Path:
@@ -37,6 +41,14 @@ MODEL_PATH = resolve_model_path()
 @st.cache_resource
 def load_model():
     return YOLO(str(MODEL_PATH))
+
+
+@st.cache_resource
+def load_people_client():
+    return InferenceHTTPClient(
+        api_url=ROBOFLOW_API_URL,
+        api_key=ROBOFLOW_API_KEY,
+    )
 
 
 def draw_detections(image_bgr, results, conf_threshold):
@@ -64,6 +76,36 @@ def draw_detections(image_bgr, results, conf_threshold):
 
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     return image_rgb, detections
+
+
+def detect_people(image_bgr, conf_threshold, client=None):
+    """Roda o modelo Roboflow de pessoas e retorna predicoes acima do limiar."""
+    client = client or load_people_client()
+    result = client.infer(image_bgr, model_id=PEOPLE_MODEL_ID)
+    predictions = result.get("predictions", []) if isinstance(result, dict) else []
+
+    people = []
+    for pred in predictions:
+        conf = float(pred.get("confidence", 0))
+        if conf < conf_threshold:
+            continue
+
+        class_name = str(pred.get("class", pred.get("class_name", ""))).lower()
+        if class_name and class_name not in {"person", "people"}:
+            continue
+
+        people.append(pred)
+
+    return people
+
+
+def robbery_detected(gun_detections, people_detections):
+    return bool(gun_detections) and bool(people_detections)
+
+
+def show_robbery_message(is_detected):
+    if is_detected:
+        st.error("robbery detected!")
 
 
 # --- Sidebar ---
@@ -98,6 +140,12 @@ if modo == "Imagem":
 
         # Desenhar e mostrar
         img_result, detections = draw_detections(img_bgr.copy(), results, conf_threshold)
+        people_detections = []
+        if detections:
+            try:
+                people_detections = detect_people(img_bgr, conf_threshold)
+            except Exception as exc:
+                st.warning(f"Nao foi possivel rodar o modelo de pessoas: {exc}")
 
         col1, col2 = st.columns(2)
         with col1:
@@ -106,6 +154,8 @@ if modo == "Imagem":
         with col2:
             st.subheader(f"Deteccoes: {len(detections)}")
             st.image(img_result, width='stretch')
+
+        show_robbery_message(robbery_detected(detections, people_detections))
 
         if detections:
             st.dataframe(detections, width='stretch')
@@ -132,10 +182,12 @@ elif modo == "Video":
 
         frame_placeholder = st.empty()
         status_text = st.empty()
+        robbery_placeholder = st.empty()
         stop_btn = st.button("Parar")
 
         frame_count = 0
         detection_count = 0
+        robbery_count = 0
 
         while cap.isOpened() and not stop_btn:
             ret, frame = cap.read()
@@ -148,13 +200,25 @@ elif modo == "Video":
             if frame_count % 2 == 0:
                 results = model.predict(frame, conf=conf_threshold, verbose=False)
                 frame_result, detections = draw_detections(frame.copy(), results, conf_threshold)
+                people_detections = []
+                if detections:
+                    try:
+                        people_detections = detect_people(frame, conf_threshold)
+                    except Exception:
+                        people_detections = []
+                has_robbery = robbery_detected(detections, people_detections)
                 detection_count += len(detections)
+                robbery_count += int(has_robbery)
                 frame_placeholder.image(frame_result, width='stretch')
                 status_text.text(f"Frame {frame_count}/{total_frames} | Deteccoes neste frame: {len(detections)}")
+                if has_robbery:
+                    robbery_placeholder.error("robbery detected!")
+                else:
+                    robbery_placeholder.empty()
 
         cap.release()
         Path(tmp.name).unlink(missing_ok=True)
-        st.success(f"Video processado! {frame_count} frames | {detection_count} deteccoes totais")
+        st.success(f"Video processado! {frame_count} frames | {detection_count} deteccoes totais | {robbery_count} alertas")
 
 # ==========================
 # MODO CAMERA (REALTIME)
@@ -165,12 +229,15 @@ elif modo == "Camera":
     class GunDetector(VideoProcessorBase):
         def __init__(self):
             self.model = load_model()
+            self.people_client = load_people_client()
             self.conf = conf_threshold
+            self.robbery_detected = False
 
         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
             img_bgr = frame.to_ndarray(format="bgr24")
 
             results = self.model.predict(img_bgr, conf=self.conf, verbose=False)
+            gun_detections = []
 
             for r in results:
                 for box in r.boxes:
@@ -185,12 +252,30 @@ elif modo == "Camera":
                     (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                     cv2.rectangle(img_bgr, (x1, y1 - h - 8), (x1 + w, y1), (0, 0, 255), -1)
                     cv2.putText(img_bgr, label, (x1, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                    gun_detections.append({"classe": name, "confianca": conf})
+
+            people_detections = []
+            if gun_detections:
+                try:
+                    people_detections = detect_people(img_bgr, self.conf, self.people_client)
+                except Exception:
+                    people_detections = []
+
+            self.robbery_detected = robbery_detected(gun_detections, people_detections)
 
             return av.VideoFrame.from_ndarray(img_bgr, format="bgr24")
 
-    webrtc_streamer(
+    ctx = webrtc_streamer(
         key="gun-detection",
         video_processor_factory=GunDetector,
         media_stream_constraints={"video": {"width": 1280, "height": 720}, "audio": False},
         async_processing=True,
     )
+
+    robbery_placeholder = st.empty()
+    while ctx.state.playing:
+        if ctx.video_processor and ctx.video_processor.robbery_detected:
+            robbery_placeholder.error("robbery detected!")
+        else:
+            robbery_placeholder.empty()
+        time.sleep(0.5)
